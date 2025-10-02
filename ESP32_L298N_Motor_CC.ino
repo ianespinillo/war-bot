@@ -13,22 +13,33 @@ const unsigned int IN2 = 5;
 const int HALL_PIN = 35;
 const int HALL_2_PIN = 34;
 
-// instancia de imanes y vueltas
+// Instancia de imanes y vueltas
 int hall_magnet_count = 0;
 int hall_2_magnet_count = 0;
 int hall_laps_count = 0;
 int hall_2_laps_count = 0;
 
 // Variables para el control de estabilidad
-int last_hall_count = 0;
-int last_hall_2_count = 0;
 unsigned long last_correction_time = 0;
-const unsigned long CORRECTION_INTERVAL = 70; // ms entre correcciones
+const unsigned long CORRECTION_INTERVAL = 20; // ms entre correcciones (reducido para mejor respuesta)
 
-// Parámetros de control
-const int MAX_SPEED_DIFFERENCE = 10; // Diferencia máxima de velocidad permitida
-const int BASE_SPEED = 70; // Velocidad base
-const int MAGNET_DIFFERENCE_THRESHOLD = 1; // Umbral de diferencia de imanes para corrección
+// Parámetros de control mejorados
+const int BASE_SPEED = 70;
+const int MOTOR1_OFFSET = 0;    // Ajusta este valor si motor 1 es más débil (ej: 5, 10, 15)
+const int MOTOR2_OFFSET = 0;    // Ajusta este valor si motor 2 es más débil (ej: 5, 10, 15)
+
+// Control PID simplificado
+float Kp = 3.0;  // Ganancia proporcional - aumenta para corrección más agresiva
+float Ki = 0.1;  // Ganancia integral - acumula error a lo largo del tiempo
+float Kd = 0.5;  // Ganancia derivativa - suaviza cambios bruscos
+
+float error_integral = 0;
+float last_error = 0;
+
+// Límites
+const int MAX_SPEED_ADJUSTMENT = 20;
+const int MIN_SPEED = 50;
+const int MAX_SPEED = 100;
 
 // Crear una instancia de los motores
 L298N motor(ENA, IN1, IN2);
@@ -52,124 +63,107 @@ void IRAM_ATTR hall2Interrupt(){
 
 void setup()
 {
-  // Usado para mostrar información
   Serial.begin(115200);
 
-  // Configurar el pin del sensor hall como entrada
   pinMode(HALL_PIN, INPUT);
   pinMode(HALL_2_PIN, INPUT);
 
-  // manejo de deteccion de iman
   attachInterrupt(digitalPinToInterrupt(HALL_PIN), hallInterrupt, FALLING);
   attachInterrupt(digitalPinToInterrupt(HALL_2_PIN), hall2Interrupt, FALLING);
   
-  // Establecer la velocidad inicial
-  motor.setSpeed(BASE_SPEED);
-  motor2.setSpeed(BASE_SPEED);
+  // Establecer velocidad inicial con offset de calibración
+  motor.setSpeed(BASE_SPEED + MOTOR1_OFFSET);
+  motor2.setSpeed(BASE_SPEED + MOTOR2_OFFSET);
+  
+  Serial.println("Sistema iniciado con calibración");
+  Serial.print("Motor 1 offset: "); Serial.println(MOTOR1_OFFSET);
+  Serial.print("Motor 2 offset: "); Serial.println(MOTOR2_OFFSET);
 }
 
 void loop()
 { 
   // Control de estabilidad del vehículo
-  stabilizeVehicle();
+  stabilizeVehiclePID();
   
-  // Leer el estado del sensor hall
-  // Indicar al motor que avance (depende del cableado)
-  motor.forward();
-  motor2.forward();
+  // Motores en movimiento
+  motor.backward();
+  motor2.backward();
 
-  // Imprimir el estado del motor en el monitor serial
-  printSomeInfo();
+  // Imprimir información de depuración
+  printDebugInfo();
 
-  delay(50); // Reducir delay para mejor respuesta
+  delay(30);
 }
 
 /*
-Algoritmo de estabilización para evitar que el auto se gire
+Algoritmo de estabilización con control PID
 */
-void stabilizeVehicle() {
+void stabilizeVehiclePID() {
   unsigned long current_time = millis();
   
-  // Ejecutar corrección solo cada cierto intervalo
   if (current_time - last_correction_time >= CORRECTION_INTERVAL) {
+    float delta_time = (current_time - last_correction_time) / 1000.0; // en segundos
     last_correction_time = current_time;
     
-    // Calcular diferencia entre los conteos de imanes
-    int magnet_difference = hall_magnet_count - hall_2_magnet_count;
-    int total_difference = (hall_laps_count * 8 + hall_magnet_count) - 
-                          (hall_2_laps_count * 8 + hall_2_magnet_count);
+    // Calcular conteo total de imanes de cada motor
+    int total_count_motor1 = hall_laps_count * 8 + hall_magnet_count;
+    int total_count_motor2 = hall_2_laps_count * 8 + hall_2_magnet_count;
     
-    // Aplicar corrección solo si la diferencia supera el umbral
-    if (abs(magnet_difference) > MAGNET_DIFFERENCE_THRESHOLD) {
-      adjustMotorSpeeds(magnet_difference);
-    } else {
-      // Mantener velocidades base si la diferencia es mínima
-      motor.setSpeed(BASE_SPEED);
-      motor2.setSpeed(BASE_SPEED);
-    }
+    // Error: diferencia entre motores (positivo si motor1 va más rápido)
+    float error = total_count_motor1 - total_count_motor2;
     
-    // Debug información
-    Serial.print("Diferencia: ");
-    Serial.print(magnet_difference);
-    Serial.print(" | Total: ");
-    Serial.print(total_difference);
-    Serial.print(" | M1: ");
-    Serial.print(hall_magnet_count);
-    Serial.print(" | M2: ");
-    Serial.println(hall_2_magnet_count);
+    // Control PID
+    error_integral += error * delta_time;
+    // Anti-windup: limitar la integral
+    error_integral = constrain(error_integral, -50, 50);
+    
+    float error_derivative = (error - last_error) / delta_time;
+    
+    // Calcular ajuste PID
+    float pid_output = (Kp * error) + (Ki * error_integral) + (Kd * error_derivative);
+    
+    // Limitar ajuste
+    pid_output = constrain(pid_output, -MAX_SPEED_ADJUSTMENT, MAX_SPEED_ADJUSTMENT);
+    
+    // Calcular nuevas velocidades con offset de calibración
+    int speed_motor1 = BASE_SPEED + MOTOR1_OFFSET - pid_output;
+    int speed_motor2 = BASE_SPEED + MOTOR2_OFFSET + pid_output;
+    
+    // Aplicar límites
+    speed_motor1 = constrain(speed_motor1, MIN_SPEED, MAX_SPEED);
+    speed_motor2 = constrain(speed_motor2, MIN_SPEED, MAX_SPEED);
+    
+    // Aplicar velocidades
+    motor.setSpeed(speed_motor1);
+    motor2.setSpeed(speed_motor2);
+    
+    // Guardar error para próxima iteración
+    last_error = error;
+    
+    // Debug
+    Serial.print("Error: "); Serial.print(error);
+    Serial.print(" | PID: "); Serial.print(pid_output);
+    Serial.print(" | M1 Speed: "); Serial.print(speed_motor1);
+    Serial.print(" | M2 Speed: "); Serial.println(speed_motor2);
   }
 }
 
 /*
-Ajusta las velocidades de los motores basado en la diferencia de imanes
+Imprimir información de depuración
 */
-void adjustMotorSpeeds(int difference) {
-  int speed_motor1 = BASE_SPEED;
-  int speed_motor2 = BASE_SPEED;
-  
-  if (difference > 0) {
-    // Motor 1 está girando más rápido (más imanes detectados)
-    // Reducir velocidad del motor 1 o aumentar motor 2
-    speed_motor1 = constrain(BASE_SPEED - abs(difference) * 2, BASE_SPEED - MAX_SPEED_DIFFERENCE, BASE_SPEED);
-    speed_motor2 = constrain(BASE_SPEED + abs(difference), BASE_SPEED, BASE_SPEED + MAX_SPEED_DIFFERENCE);
-  } else if (difference < 0) {
-    // Motor 2 está girando más rápido (más imanes detectados)
-    // Reducir velocidad del motor 2 o aumentar motor 1
-    speed_motor1 = constrain(BASE_SPEED + abs(difference), BASE_SPEED, BASE_SPEED + MAX_SPEED_DIFFERENCE);
-    speed_motor2 = constrain(BASE_SPEED - abs(difference) * 2, BASE_SPEED - MAX_SPEED_DIFFERENCE, BASE_SPEED);
-  }
-  
-  // Aplicar las nuevas velocidades
-  motor.setSpeed(speed_motor1);
-  motor2.setSpeed(speed_motor2);
-  
-  Serial.print("Ajustando - M1: ");
-  Serial.print(speed_motor1);
-  Serial.print(" | M2: ");
-  Serial.println(speed_motor2);
-}
-
-/*
-Imprimir algunas informaciones en el Monitor Serial
-*/
-void printSomeInfo()
+void printDebugInfo()
 {
-  Serial.print("Motor 1 - Movimiento: ");
-  Serial.print(motor.isMoving());
-  Serial.print(" | Velocidad: ");
-  Serial.print(motor.getSpeed());
-  Serial.print(" | Imanes: ");
-  Serial.print(hall_magnet_count);
-  Serial.print(" | Vueltas: ");
-  Serial.println(hall_laps_count);
-
-  Serial.print("Motor 2 - Movimiento: ");
-  Serial.print(motor2.isMoving());
-  Serial.print(" | Velocidad: ");
-  Serial.print(motor2.getSpeed());
-  Serial.print(" | Imanes: ");
-  Serial.print(hall_2_magnet_count);
-  Serial.print(" | Vueltas: ");
-  Serial.println(hall_2_laps_count);
+  int total_m1 = hall_laps_count * 8 + hall_magnet_count;
+  int total_m2 = hall_2_laps_count * 8 + hall_2_magnet_count;
+  
+  Serial.println("=== Estado de Motores ===");
+  Serial.print("Motor 1 - Total imanes: "); Serial.print(total_m1);
+  Serial.print(" | Velocidad: "); Serial.println(motor.getSpeed());
+  
+  Serial.print("Motor 2 - Total imanes: "); Serial.print(total_m2);
+  Serial.print(" | Velocidad: "); Serial.println(motor2.getSpeed());
+  
+  Serial.print("Diferencia total: "); Serial.println(total_m1 - total_m2);
+  Serial.print("Integral acumulada: "); Serial.println(error_integral);
   Serial.println("------------------------");
 }
